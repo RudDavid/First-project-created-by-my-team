@@ -23,11 +23,12 @@ jobs:
      permissions:
       issues: write
       pull-requests: write
-    steps:
+     steps:
       - name: Установить номер PR
         id: pr
         run: |
           if ("${{ github.event_name }}" -eq "pull_request_target") {
+
             $pr = "${{ github.event.number }}"
           } else {
             $pr = "${{ github.event.inputs.pr_number }}"
