@@ -16,10 +16,9 @@ env:
 
 jobs:
   build-and-test:
-    if: |
-      (github.event_name != 'pull_request_target' ||
-       (github.event.pull_request.user.login == 'RudDavid' && github.event.pull_request.base.ref == 'main')) &&
-      (github.event_name != 'synchronize' || github.event.before != github.event.after)
+     if: |
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.pull_request.user.login == 'RudDavid' && github.event.pull_request.base.ref == 'main')
     runs-on: windows-latest
     permissions:
       issues: write
