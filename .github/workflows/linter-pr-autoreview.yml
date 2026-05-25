@@ -12,13 +12,13 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  PROJECT_NAME: ProjectAdam   # ← имя папки проекта и файла .csproj (без расширения)
+  PROJECT_NAME: Our first project   # ← имя папки проекта и файла .csproj (без расширения)
 
 jobs:
   build-and-test:
     if: |
       (github.event_name != 'pull_request_target' ||
-       (github.event.pull_request.user.login == 'Silmarill' && github.event.pull_request.base.ref == 'main')) &&
+       (github.event.pull_request.user.login == 'RudDavid' && github.event.pull_request.base.ref == 'main')) &&
       (github.event_name != 'synchronize' || github.event.before != github.event.after)
     runs-on: windows-latest
     permissions:
