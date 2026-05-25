@@ -1,0 +1,314 @@
+name: Linter-ревью по PR (auto)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Номер Pull Request для проверки'
+        required: true
+        type: number
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PROJECT_NAME: ProjectAdam   # ← имя папки проекта и файла .csproj (без расширения)
+
+jobs:
+  build-and-test:
+    if: |
+      (github.event_name != 'pull_request_target' ||
+       (github.event.pull_request.user.login == 'Silmarill' && github.event.pull_request.base.ref == 'main')) &&
+      (github.event_name != 'synchronize' || github.event.before != github.event.after)
+    runs-on: windows-latest
+    permissions:
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Установить номер PR
+        id: pr
+        run: |
+          if ("${{ github.event_name }}" -eq "pull_request_target") {
+            $pr = "${{ github.event.number }}"
+          } else {
+            $pr = "${{ github.event.inputs.pr_number }}"
+          }
+          echo "number=$pr" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          echo "PR_NUMBER=$pr" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        shell: pwsh
+
+      - name: Получить код репозитория (ветка студента)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/pull/${{ steps.pr.outputs.number }}/head
+          fetch-depth: 1
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Получить скрипты и конфиги из ветки main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main-branch
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Установить MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Установить зависимости Python
+        run: pip install regex
+
+      - name: Копировать .editorconfig
+        run: |
+          if (Test-Path "${{ github.workspace }}/main-branch/.editorconfig") {
+            Copy-Item -Path "${{ github.workspace }}/main-branch/.editorconfig" -Destination "${{ github.workspace }}/.editorconfig" -Force
+          } else {
+            Write-Host ".editorconfig не найден"
+          }
+        shell: pwsh
+
+      - name: Копировать Settings.StyleCop.json
+        run: |
+          if (Test-Path "${{ github.workspace }}/main-branch/Settings.StyleCop.json") {
+            Copy-Item -Path "${{ github.workspace }}/main-branch/Settings.StyleCop.json" -Destination "${{ github.workspace }}/${{ env.PROJECT_NAME }}/Settings.StyleCop.json" -Force
+          } else {
+            Write-Host "Settings.StyleCop.json не найден"
+          }
+        shell: pwsh
+
+      - name: Конвертировать проект в SDK-style и добавить StyleCop
+        run: |
+          pwsh "${{ github.workspace }}/main-branch/.github/scripts/convert_and_add_stylecop.ps1" `
+            -CsprojPath "${{ github.workspace }}/${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.csproj" `
+            -Workspace "${{ github.workspace }}"
+        shell: pwsh
+
+      - name: Кэшировать NuGet пакеты
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles(format('**/{0}.csproj', env.PROJECT_NAME)) }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Кэшировать .NET tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.dotnet/tools
+          key: ${{ runner.os }}-dotnet-tools
+
+      - name: Восстановить NuGet пакеты
+        run: dotnet restore ${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.csproj
+
+      # Шаг сборки БЕЗ continue-on-error, реальный код возврата
+      - name: Собрать проект
+        id: build
+        run: |
+          dotnet build ${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.csproj 2>&1 | Tee-Object -FilePath build.log
+          $exitCode = $LASTEXITCODE
+          echo "BUILD_EXIT_CODE=$exitCode" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ($exitCode -ne 0) {
+            Write-Host "❌ Сборка завершилась с ошибкой. Код: $exitCode"
+            Write-Host "Последние строки лога:"
+            Get-Content build.log -Tail 30
+            exit $exitCode   # Реальная ошибка, workflow продолжит только шаги с if: failure()
+          }
+        shell: pwsh
+
+      # Этот шаг выполнится ТОЛЬКО если сборка упала (failure)
+      - name: Обработка ошибки сборки (переименование PR и комментарий)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN || github.token }}
+          script: |
+            const prNumber = ${{ steps.pr.outputs.number }};
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            try {
+              // Получить текущее название PR
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber
+              });
+              let title = pr.title;
+              if (!title.includes('[BUILD FAILED]')) {
+                title = title + ' [BUILD FAILED]';
+                await github.rest.pulls.update({
+                  owner, repo, pull_number: prNumber,
+                  title: title
+                });
+                console.log('PR переименован');
+              }
+
+              // Прочитать последние 30 строк лога сборки
+              const fs = require('fs');
+              const logPath = process.env.GITHUB_WORKSPACE + '/build.log';
+              let lastLines = 'Лог сборки не найден.';
+              if (fs.existsSync(logPath)) {
+                const content = fs.readFileSync(logPath, 'utf8');
+                const lines = content.split(/\r?\n/);
+                const last30 = lines.slice(-30).join('\n');
+                lastLines = last30;
+              }
+
+              // Создать комментарий в PR
+              const commentBody = `## ❌ Сборка не удалась\n\n**PR переименован с добавлением [BUILD FAILED]**\n\nПоследние 30 строк вывода сборки:\n\n\`\`\`\n${lastLines}\n\`\`\``;
+              await github.rest.issues.createComment({
+                issue_number: prNumber,
+                owner, repo,
+                body: commentBody
+              });
+              console.log('Комментарий создан');
+            } catch (error) {
+              console.error('Ошибка при обработке ошибки сборки:', error);
+            }
+
+      # Удалить метку [BUILD FAILED] в случае успешной сборки
+      - name: Убрать метку [BUILD FAILED] из названия PR (если есть)
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN || github.token }}
+          script: |
+            const prNumber = ${{ steps.pr.outputs.number }};
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            try {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              let title = pr.title;
+              if (title.includes('[BUILD FAILED]')) {
+                title = title.replace(/\[BUILD FAILED\]/g, '').trim();
+                await github.rest.pulls.update({ owner, repo, pull_number: prNumber, title: title });
+                console.log('Метка [BUILD FAILED] удалена');
+              }
+            } catch (error) {
+              console.error('Ошибка при удалении метки:', error);
+            }
+
+      # Все последующие шаги – только при успешной сборке
+      - name: Проверить IDE форматирование (dotnet format)
+        if: success()
+        run: |
+          dotnet tool install -g dotnet-format
+          dotnet format ${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.csproj style --verify-no-changes --severity info > ide_warnings.txt 2>&1
+          exit 0
+        shell: pwsh
+
+      - name: Объединить логи
+        if: success()
+        run: |
+          Get-Content build.log > combined.log
+          Add-Content combined.log "`n=== Предупреждения dotnet format ===`n"
+          if (Test-Path ide_warnings.txt) {
+            Get-Content ide_warnings.txt >> combined.log
+          } else {
+            Add-Content combined.log "Файл с предупреждениями IDE не найден."
+          }
+        shell: pwsh
+
+      - name: Преобразовать лог в JSON
+        if: success()
+        run: |
+          python "${{ github.workspace }}/main-branch/.github/scripts/parse_log_to_json.py" `
+            --log-file "${{ github.workspace }}/combined.log" `
+            --output-json "${{ github.workspace }}/warnings.json"
+
+      - name: Создать текстовый отчёт
+        if: success()
+        run: |
+          python "${{ github.workspace }}/main-branch/.github/scripts/generate_report_from_json.py" `
+            --json-file "${{ github.workspace }}/warnings.json" `
+            --output-txt "${{ github.workspace }}/stylecop_report.txt"
+
+      - name: Получить текущую дату и время
+        if: success()
+        id: date
+        run: |
+          $date = (Get-Date -Format "yyyy-MM-dd-HHmm")
+          echo "date=$date" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        shell: pwsh
+
+      - name: Сформировать имя артефакта
+        if: success()
+        id: artifact_name
+        run: |
+          $repoName = "${{ github.event.repository.name }}"
+          $prNumber = "${{ steps.pr.outputs.number }}"
+          $runNumber = "${{ github.run_number }}"
+          $shaShort = "${{ github.sha }}"[0..3] -join ''
+          $date = "${{ steps.date.outputs.date }}"
+          $artifactName = "${repoName}_PR${prNumber}_${date}_${runNumber}-${shaShort}"
+          echo "name=$artifactName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        shell: pwsh
+
+      - name: Сохранить артефакты
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact_name.outputs.name }}
+          path: |
+            build.log
+            ide_warnings.txt
+            combined.log
+            warnings.json
+            stylecop_report.txt
+
+      - name: Проанализировать предупреждения и оставить комментарий в PR
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN || github.token }}
+          script: |
+            const fs = require('fs');
+            const warningsPath = process.env.GITHUB_WORKSPACE + '/warnings.json';
+            let warningCount = 0;
+
+            if (fs.existsSync(warningsPath)) {
+              try {
+                const data = JSON.parse(fs.readFileSync(warningsPath, 'utf8'));
+                if (Array.isArray(data)) {
+                  warningCount = data.length;
+                } else if (data.warnings && Array.isArray(data.warnings)) {
+                  warningCount = data.warnings.length;
+                } else {
+                  warningCount = Object.keys(data).length;
+                }
+              } catch (e) {
+                console.log('Ошибка парсинга JSON:', e.message);
+                warningCount = -1;
+              }
+            }
+
+            let message = '';
+            if (warningCount === 0) {
+              message = '✅ Все автоматические проверки кода прошли успешно.';
+            } else if (warningCount > 0 && warningCount <= 5) {
+              message = '👍 В целом неплохо, хорошая работа! Пожалуйста, ознакомьтесь с небольшими замечаниями.';
+            } else if (warningCount > 5) {
+              message = '⚠️ Требуется доработка. Ознакомьтесь с замечаниями и исправьте код.';
+            } else {
+              message = '❌ Не удалось получить количество предупреждений. Проверьте логи сборки вручную.';
+            }
+
+            const reportPath = process.env.GITHUB_WORKSPACE + '/stylecop_report.txt';
+            let fullReport = 'Детальный отчёт недоступен.';
+            if (fs.existsSync(reportPath)) {
+              fullReport = fs.readFileSync(reportPath, 'utf8');
+            }
+            const truncatedReport = fullReport.length > 50000 ? fullReport.substring(0, 50000) + '\n... (обрезано - см. артефакты в Actions)' : fullReport;
+
+            const commentBody = `## Анализ качества кода\n\n**Найдено предупреждений: ${warningCount === -1 ? 'ошибка' : warningCount}**\n\n${message}\n\n\`\`\`\n${truncatedReport}\n\`\`\``;
+
+            github.rest.issues.createComment({
+              issue_number: ${{ steps.pr.outputs.number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
